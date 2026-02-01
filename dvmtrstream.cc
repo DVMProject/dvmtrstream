@@ -47,6 +47,9 @@ struct stream_t {
     ip::udp::endpoint remote_endpoint;
     std::queue<audio_chunk_t> chunk_queue;
     std::mutex queue_mutex;
+    bool silence_leader_injected = false;  // Track if silence leader has been added
+    int32_t last_call_tgid = -1;  // Last talkgroup ID
+    int32_t last_call_src = -1;   // Last source ID
 };
 
 std::vector<std::shared_ptr<stream_t>> streams;
@@ -57,6 +60,9 @@ struct endpoint_group_t {
     std::shared_ptr<boost::asio::steady_timer> timer;
     size_t current_stream_index = 0;
     bool timer_active = false;
+    int inter_stream_delay_ms = 0;  // Delay between switching streams (ms)
+    bool switching_stream = false;  // True when in delay period between streams
+    int silence_leader_ms = 0;  // Silence to inject before stream audio (ms)
 };
 
 std::vector<std::shared_ptr<endpoint_group_t>> endpoint_groups;
@@ -82,12 +88,27 @@ class DVMTRStream : public Plugin_Api {
     std::unique_ptr<std::thread> io_thread;
     std::unique_ptr<io_service::work> work_guard;
 
+    int global_silence_leader = 0; // global silence leader in ms
+    int global_inter_stream_delay = 0; // global inter-stream delay in ms
+
 public:
     DVMTRStream() { }
 
     int parse_config(json config_data) {
         std::map<std::string, std::shared_ptr<endpoint_group_t>> endpoint_map;
-        
+
+        // read global inter-stream delay if configured
+        if (config_data.contains("interStreamDelay")) {
+            global_inter_stream_delay = config_data["interStreamDelay"];
+            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: inter-stream delay set to " << global_inter_stream_delay << "ms";
+        }
+
+        // read global silence leader if configured
+        if (config_data.contains("silenceLeader")) {
+            global_silence_leader = config_data["silenceLeader"];
+            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: silence leader set to " << global_silence_leader << "ms";
+        }
+
         for (json element : config_data["streams"]) {
             auto stream = std::make_shared<stream_t>();
             stream->TGID = element["TGID"];
@@ -95,7 +116,7 @@ public:
             stream->port = element["port"];
             stream->short_name = element["shortName"];   // we require shortName because dvmbridge can only handle one system ID at a time
             stream->remote_endpoint = ip::udp::endpoint(ip::address::from_string(stream->address), stream->port);
-            
+
             // create endpoint key
             std::string endpoint_key = stream->address + ":" + std::to_string(stream->port);
             
@@ -103,17 +124,19 @@ public:
             if (endpoint_map.find(endpoint_key) == endpoint_map.end()) {
                 auto group = std::make_shared<endpoint_group_t>();
                 group->endpoint_key = endpoint_key;
+                group->inter_stream_delay_ms = global_inter_stream_delay;
+                group->silence_leader_ms = global_silence_leader;
                 endpoint_map[endpoint_key] = group;
                 endpoint_groups.push_back(group);
                 BOOST_LOG_TRIVIAL(info) << "dvmtrstream: created endpoint group for " << endpoint_key;
             }
-            
+
             endpoint_map[endpoint_key]->streams.push_back(stream);
             streams.push_back(stream);
-            
+
             BOOST_LOG_TRIVIAL(info) << "dvmtrstream: will stream audio from TGID " << stream->TGID << " on System " << stream->short_name << " to " << stream->address << " on port " << stream->port;
         }
-        
+
         BOOST_LOG_TRIVIAL(info) << "dvmtrstream: configured " << endpoint_groups.size() << " endpoint group(s) with " << streams.size() << " total stream(s)";
         return 0;
     }
@@ -171,6 +194,49 @@ public:
                         // queue chunks instead of sending immediately
                         std::lock_guard<std::mutex> lock(stream->queue_mutex);
                         
+                        // are we injecting a silence leader?
+                        if (global_silence_leader > 0) {
+                            // check if call source or talkgroup changed
+                            bool call_changed = (stream->last_call_tgid != call_tgid || stream->last_call_src != call_src);
+
+                            // inject silence leader if configured and call changed
+                            if (call_changed && !stream->silence_leader_injected) {
+                                // find the endpoint group for this stream to get silence_leader_ms
+                                int silence_leader_ms = 0;
+                                for (auto& group : endpoint_groups) {
+                                    for (auto& grp_stream : group->streams) {
+                                        if (grp_stream.get() == stream.get()) {
+                                            silence_leader_ms = group->silence_leader_ms;
+                                            break;
+                                        }
+                                    }
+                                    if (silence_leader_ms > 0) break;
+                                }
+
+                                if (silence_leader_ms > 0) {
+                                    // each chunk is 20ms, calculate how many silence chunks needed
+                                    int silence_chunks = (silence_leader_ms + 19) / 20;  // round up
+
+                                    uint8_t silenceChunk[320];
+                                    ::memset(silenceChunk, 0, sizeof(silenceChunk));
+
+                                    for (int i = 0; i < silence_chunks; i++) {
+                                        audio_chunk_t silent_chunk(silenceChunk, chunkSize, call_tgid, call_src);
+                                        stream->chunk_queue.push(silent_chunk);
+                                    }
+
+                                    stream->silence_leader_injected = true;
+                                    BOOST_LOG_TRIVIAL(debug) << "injected " << silence_chunks << " silence chunks (" 
+                                                            << (silence_chunks * 20) << "ms) before audio for TGID " << TGID 
+                                                            << " SRC " << call_src << " (call changed)";
+                                }
+                            }
+                        }
+
+                        // update last call tracking
+                        stream->last_call_tgid = call_tgid;
+                        stream->last_call_src = call_src;
+                        
                         // queue complete chunks
                         for (int i = 0; i < totalChunks; i++) {
                             // calculate the starting position of the current chunk
@@ -211,17 +277,17 @@ public:
 
     int start() {
         udp_socket.open(ip::udp::v4());
-        
+
         // create work guard to keep io_service running
         work_guard = std::make_unique<io_service::work>(io);
-        
+
         // initialize timer for each endpoint group
         for (auto& group : endpoint_groups) {
             group->timer = std::make_shared<boost::asio::steady_timer>(io);
             group->timer_active = true;
             schedule_next_send(group.get());
         }
-        
+
         // start io_service in a separate thread
         io_thread = std::make_unique<std::thread>([this]() {
             BOOST_LOG_TRIVIAL(info) << "dvmtrstream: starting io_service thread";
@@ -240,16 +306,16 @@ public:
                 group->timer->cancel();
             }
         }
-        
+
         // stop io_service
         work_guard.reset();
         io.stop();
-        
+
         // wait for io_thread to finish
         if (io_thread && io_thread->joinable()) {
             io_thread->join();
         }
-        
+
         udp_socket.close();
         return 0;
     }
@@ -281,11 +347,11 @@ private:
         // find next stream with data in this endpoint group, starting from current_stream_index
         stream_t* active_stream = nullptr;
         size_t start_index = group->current_stream_index;
-        
+
         for (size_t i = 0; i < group->streams.size(); i++) {
             size_t check_index = (start_index + i) % group->streams.size();
             auto& stream = group->streams[check_index];
-            
+
             std::lock_guard<std::mutex> lock(stream->queue_mutex);
             if (!stream->chunk_queue.empty()) {
                 // found stream with data - check if it's the current one or need to switch
@@ -320,7 +386,12 @@ private:
         std::memcpy(chunkBuffer + 4, chunk.data.data(), chunk.data.size());
 
         uint32_t dstId = static_cast<uint32_t>(chunk.tgid);
-        
+
+        // if the actual talkgroup is negative, set to 0
+        if (chunk.tgid < 0) {
+            dstId = 0;
+        }
+
         // limit to 24 bits
         if (dstId > 0xFFFFFF) {
             dstId = 0;
@@ -329,6 +400,11 @@ private:
         SET_UINT32(dstId, chunkBuffer, 4 + chunk.data.size());
 
         uint32_t srcId = static_cast<uint32_t>(chunk.src);
+
+        // if the actual source is negative, set to 0
+        if (chunk.src < 0) {
+            srcId = 0;
+        }
 
         // limit to 24 bits
         if (srcId > 0xFFFFFF) {
@@ -348,7 +424,33 @@ private:
 
         // if current stream is empty, move to next stream on next cycle
         if (!has_more) {
-            group->current_stream_index = (group->current_stream_index + 1) % group->streams.size();
+            // reset silence leader flag for next transmission
+            active_stream->silence_leader_injected = false;
+
+            // check if inter-stream delay is configured
+            if (group->inter_stream_delay_ms > 0) {
+                // enter delay period before switching to next stream
+                group->switching_stream = true;
+                BOOST_LOG_TRIVIAL(debug) << "endpoint " << group->endpoint_key 
+                                         << ": Stream TGID " << active_stream->TGID 
+                                         << " complete, delaying " << group->inter_stream_delay_ms << "ms before next stream";
+
+                // schedule with delay
+                if (group->timer && group->timer_active) {
+                    group->timer->expires_from_now(std::chrono::milliseconds(group->inter_stream_delay_ms));
+                    group->timer->async_wait([this, group](const boost::system::error_code& error) {
+                        if (!error && group->timer_active) {
+                            group->switching_stream = false;
+                            group->current_stream_index = (group->current_stream_index + 1) % group->streams.size();
+                            send_next_chunk(group);
+                        }
+                    });
+                }
+                return;  // don't schedule normal send, we scheduled the delayed one
+            } else {
+                // no delay, switch immediately
+                group->current_stream_index = (group->current_stream_index + 1) % group->streams.size();
+            }
         }
 
         // schedule next send for this endpoint group
