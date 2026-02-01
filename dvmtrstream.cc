@@ -164,18 +164,38 @@ public:
                         int32_t bytes = sampleCount * 2;
                         const int16_t chunkSize = 320; // 20ms of 8kHz 16-bit audio (160 samples * 2 bytes)
                         int16_t totalChunks = bytes / chunkSize;
+                        int32_t remainingBytes = bytes % chunkSize;
 
                         uint8_t* sampleBytes = (uint8_t*)samples;
 
-                        // Queue chunks instead of sending immediately
+                        // queue chunks instead of sending immediately
                         std::lock_guard<std::mutex> lock(stream->queue_mutex);
+                        
+                        // queue complete chunks
                         for (int i = 0; i < totalChunks; i++) {
-                            // Calculate the starting position of the current chunk
+                            // calculate the starting position of the current chunk
                             uint8_t* curChunkStart = sampleBytes + (i * chunkSize);
 
-                            // Create and queue the chunk
+                            // queue the chunk
                             audio_chunk_t audio_chunk(curChunkStart, chunkSize, call_tgid, call_src);
                             stream->chunk_queue.push(audio_chunk);
+                        }
+
+                        // handle partial chunk - pad with silence to full 320 bytes
+                        if (remainingBytes > 0) {
+                            uint8_t paddedChunk[320];
+                            ::memset(paddedChunk, 0, sizeof(paddedChunk)); // Zero = silence for 16-bit audio
+
+                            // copy partial audio data
+                            uint8_t* partialStart = sampleBytes + (totalChunks * chunkSize);
+                            ::memcpy(paddedChunk, partialStart, remainingBytes);
+
+                            // queue padded chunk
+                            audio_chunk_t audio_chunk(paddedChunk, chunkSize, call_tgid, call_src);
+                            stream->chunk_queue.push(audio_chunk);
+
+                            BOOST_LOG_TRIVIAL(debug) << "padded partial chunk: " << remainingBytes << " bytes + " 
+                                                     << (chunkSize - remainingBytes) << " silence bytes for TGID " << TGID;
                         }
                         
                         size_t queue_size = stream->chunk_queue.size();
