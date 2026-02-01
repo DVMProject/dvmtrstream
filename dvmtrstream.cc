@@ -26,6 +26,35 @@ using namespace boost::asio;
 typedef struct plugin_t plugin_t;
 typedef struct stream_t stream_t;
 
+// ---------------------------------------------------------------------------
+//  Macros
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Sets a uint32_t into 4 bytes of a buffer/array. (32-bit value).
+ * @ingroup common
+ * @param val uint32_t value to set
+ * @param buffer uint8_t buffer to set value on
+ * @param offset Offset within uint8_t buffer
+ */
+#define SET_UINT32(val, buffer, offset)                 \
+            buffer[0U + offset] = (val >> 24) & 0xFFU;  \
+            buffer[1U + offset] = (val >> 16) & 0xFFU;  \
+            buffer[2U + offset] = (val >> 8) & 0xFFU;   \
+            buffer[3U + offset] = (val >> 0) & 0xFFU;
+
+// ---------------------------------------------------------------------------
+//  Structure Declaration
+// ---------------------------------------------------------------------------
+
+struct plugin_t {
+    Config *config;
+};
+
+/**
+ * @brief Represents an individual stream audio chunk.
+ */
+
 struct audio_chunk_t {
     std::vector<uint8_t> data;
     int32_t tgid;
@@ -35,9 +64,9 @@ struct audio_chunk_t {
         : data(chunk_data, chunk_data + size), tgid(tg), src(source) {}
 };
 
-struct plugin_t {
-    Config *config;
-};
+/**
+ * @brief Represents an individual call audio stream.
+ */
 
 struct stream_t {
     long TGID;
@@ -54,7 +83,11 @@ struct stream_t {
 
 std::vector<std::shared_ptr<stream_t>> streams;
 
-struct endpoint_group_t {
+/**
+ * @brief Represents an dvmbridge endpoint group.
+ */
+
+ struct endpoint_group_t {
     std::string endpoint_key;  // "address:port"
     std::vector<std::shared_ptr<stream_t>> streams;
     std::shared_ptr<boost::asio::steady_timer> timer;
@@ -67,19 +100,13 @@ struct endpoint_group_t {
 
 std::vector<std::shared_ptr<endpoint_group_t>> endpoint_groups;
 
-/**
- * @brief Sets a uint32_t into 4 bytes of a buffer/array. (32-bit value).
- * @ingroup common
- * @param val uint32_t value to set
- * @param buffer uint8_t buffer to set value on
- * @param offset Offset within uint8_t buffer
- */
-#define SET_UINT32(val, buffer, offset)                 \
-            buffer[0U + offset] = (val >> 24) & 0xFFU;  \
-            buffer[1U + offset] = (val >> 16) & 0xFFU;  \
-            buffer[2U + offset] = (val >> 8) & 0xFFU;   \
-            buffer[3U + offset] = (val >> 0) & 0xFFU;
+// ---------------------------------------------------------------------------
+//  Class Declaration
+// ---------------------------------------------------------------------------
 
+/**
+ * @brief Implements the actual DVM trunk-recorder dvmbridge stream plugin.
+ */
 class DVMTRStream : public Plugin_Api {
     typedef boost::asio::io_service io_service;
     io_service io;
@@ -92,15 +119,23 @@ class DVMTRStream : public Plugin_Api {
     int global_inter_stream_delay = 0; // global inter-stream delay in ms
 
 public:
+    /**
+     * @brief Initializes a new instance of the DVMTRStream class
+     */
     DVMTRStream() { }
 
+    /**
+     * @brief Helper method to parse configuration data from JSON.
+     * @param config_data 
+     * @returns int 
+     */
     int parse_config(json config_data) {
         std::map<std::string, std::shared_ptr<endpoint_group_t>> endpoint_map;
 
         // read global inter-stream delay if configured
-        if (config_data.contains("interStreamDelay")) {
-            global_inter_stream_delay = config_data["interStreamDelay"];
-            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: inter-stream delay set to " << global_inter_stream_delay << "ms";
+        if (config_data.contains("interCallDelay")) {
+            global_inter_stream_delay = config_data["interCallDelay"];
+            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: inter-stream/inter-call delay set to " << global_inter_stream_delay << "ms";
         }
 
         // read global silence leader if configured
@@ -141,8 +176,16 @@ public:
         return 0;
     }
 
-    int audio_stream(Call *call, Recorder *recorder, int16_t *samples, int sampleCount) {
-        System *call_system = call->get_system();
+    /**
+     * @brief Audio streaming handler called by trunk-recorder for each audio buffer.
+     * @param call 
+     * @param recorder 
+     * @param samples 
+     * @param sampleCount 
+     * @returns int 
+     */
+    int audio_stream(Call* call, Recorder* recorder, int16_t* samples, int sampleCount) {
+        System* call_system = call->get_system();
         int32_t call_tgid = call->get_talkgroup();
         int32_t call_src = call->get_current_source_id();
         std::string call_short_name = call->get_short_name();
@@ -165,7 +208,7 @@ public:
             }
         }
 
-        Recorder &local_recorder = *recorder;
+        Recorder& local_recorder = *recorder;
         int recorder_id = local_recorder.get_num();
         long wav_hz = local_recorder.get_wav_hz();
 
@@ -275,6 +318,10 @@ public:
         return 0;
     }
 
+    /**
+     * @brief Starts the plugin.
+     * @returns int 
+     */
     int start() {
         udp_socket.open(ip::udp::v4());
 
@@ -298,6 +345,10 @@ public:
         return 0;
     }
 
+    /**
+     * @brief Stops the plugin.
+     * @returns int 
+     */
     int stop() {
         // stop all endpoint group timers
         for (auto& group : endpoint_groups) {
@@ -326,6 +377,10 @@ public:
     }
 
 private:
+    /**
+     * @brief Helper method to schedule the next send for an endpoint group.
+     * @param group 
+     */
     void schedule_next_send(endpoint_group_t* group) {
         if (!group || !group->timer || !group->timer_active) 
             return;
@@ -338,6 +393,10 @@ private:
         });
     }
 
+    /**
+     * @brief Helper method to send the next audio chunk for an endpoint group.
+     * @param group 
+     */
     void send_next_chunk(endpoint_group_t* group) {
         if (!group || group->streams.empty()) {
             schedule_next_send(group);
