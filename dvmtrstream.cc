@@ -125,7 +125,7 @@ class DVMTRStream : public Plugin_Api {
 
     int global_silence_leader = 0; // global silence leader in ms
     int global_inter_stream_delay = 0; // global inter-stream delay in ms
-    bool allow_16khz_downsample = false; // allow sending 16kHz audio downsample to 8khz
+    bool allow_16khz_downstream = false; // allow sending 16kHz audio downstream
 
 public:
     /**
@@ -154,9 +154,9 @@ public:
         }
 
         // read allow 16kHz downstream flag
-        if (config_data.contains("allow16kHzDownsample")) {
-            allow_16khz_downsample = config_data["allow16kHzDownsample"];
-            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: allow16kHzDownsample set to " << allow_16khz_downsample;
+        if (config_data.contains("allow16kHzDownstream")) {
+            allow_16khz_downstream = config_data["allow16kHzDownstream"];
+            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: allow16kHzDownstream set to " << allow_16khz_downstream;
         }
 
         for (json element : config_data["streams"]) {
@@ -244,7 +244,7 @@ public:
         int total_samples = sampleCount;
 
         // audio at 16khz
-        if (allow_16khz_downsample) {
+        if (allow_16khz_downstream) {
             if (wav_hz == 16000) {
                 sample_ptr = new int16_t[sampleCount]; // the new buffer will be larger then the data outputted
                 total_samples = sampleCount / 2;
