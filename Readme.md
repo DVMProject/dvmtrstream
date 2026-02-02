@@ -8,6 +8,7 @@ The configuration for the dvmtrstream plugin, is extremely similar to the simple
 
 - interCallDelay - This configures a delay in-between individual call streams in milliseconds.
 - silenceLeader - This configures an injected silence leader before actual call stream audio.
+- allow16khzDownsample - Enables the plugin to downsample 16khz audio to 8khz audio. (It does this by decimation factor 2 downsampling, and applying a simple FIR filter to prevent high-frequency content satisfying Nyquist requirements for downsampling audio)
 
 ```
 {
@@ -18,7 +19,7 @@ The configuration for the dvmtrstream plugin, is extremely similar to the simple
         "library": "libdvmtrstream.so",
         "interCallDelay": 50,
         "silenceLeader": 120,
-        "allow16kHzDownstream": false,
+        "allow16khzDownsample": false,
         "streams": [
             { "TGID": 1, "shortName": "SystemName", "address": "127.0.0.1", "port": 32001 },
             { "TGID": 2, "shortName": "SystemName", "address": "127.0.0.1", "port": 32002 },
