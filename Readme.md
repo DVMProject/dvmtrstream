@@ -18,7 +18,6 @@ The configuration for the dvmtrstream plugin, is extremely similar to the simple
         "library": "libdvmtrstream.so",
         "interCallDelay": 50,
         "silenceLeader": 120,
-        "allow16kHzDownstream": false,
         "streams": [
             { "TGID": 1, "shortName": "SystemName", "address": "127.0.0.1", "port": 32001 },
             { "TGID": 2, "shortName": "SystemName", "address": "127.0.0.1", "port": 32002 },
