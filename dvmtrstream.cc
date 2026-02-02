@@ -26,14 +26,6 @@ using namespace boost::asio;
 typedef struct plugin_t plugin_t;
 typedef struct stream_t stream_t;
 
-// 15-tap low-pass FIR filter coefficients (Cutoff ~3.8kHz for 16kHz sample rate)
-// Designed to attenuate frequencies > 4kHz to prevent aliasing.
-const float filter_coeffs[15] = {
-    -0.0039f, -0.0084f, 0.0000f, 0.0261f, 0.0632f, 0.1033f, 0.1347f, 0.1466f,
-    0.1347f, 0.1033f, 0.0632f, 0.0261f, 0.0000f, -0.0084f, -0.0039f
-};
-#define FILTER_LEN 15
-
 // ---------------------------------------------------------------------------
 //  Macros
 // ---------------------------------------------------------------------------
@@ -125,7 +117,6 @@ class DVMTRStream : public Plugin_Api {
 
     int global_silence_leader = 0; // global silence leader in ms
     int global_inter_stream_delay = 0; // global inter-stream delay in ms
-    bool allow_16khz_downstream = false; // allow sending 16kHz audio downstream
 
 public:
     /**
@@ -151,12 +142,6 @@ public:
         if (config_data.contains("silenceLeader")) {
             global_silence_leader = config_data["silenceLeader"];
             BOOST_LOG_TRIVIAL(info) << "dvmtrstream: silence leader set to " << global_silence_leader << "ms";
-        }
-
-        // read allow 16kHz downstream flag
-        if (config_data.contains("allow16kHzDownstream")) {
-            allow_16khz_downstream = config_data["allow16kHzDownstream"];
-            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: allow16kHzDownstream set to " << allow_16khz_downstream;
         }
 
         for (json element : config_data["streams"]) {
@@ -227,37 +212,10 @@ public:
         int recorder_id = local_recorder.get_num();
         long wav_hz = local_recorder.get_wav_hz();
 
-        // ignore any audio above 16khz (TR doesn't do this usually, but we'll future-proof it here)
-        if (wav_hz > 16000) {
+        // ignore audio if it's not 8kHz (TODO: resample if it is)
+        if (wav_hz != 8000) {
             BOOST_LOG_TRIVIAL(warning) << "ignoring audio at " << wav_hz << " Hz samplerate, not currently supported!";
             return 1;
-        }
-
-        // ignore any audio below 8khz (TR doesn't do this usually, but we'll future-proof it here)
-        if (wav_hz < 8000) {
-            BOOST_LOG_TRIVIAL(warning) << "ignoring audio at " << wav_hz << " Hz samplerate, not currently supported!";
-            return 1;
-        }
-
-        bool isResampled = false;
-        int16_t* sample_ptr = samples;
-        int total_samples = sampleCount;
-
-        // audio at 16khz
-        if (allow_16khz_downstream) {
-            if (wav_hz == 16000) {
-                sample_ptr = new int16_t[sampleCount]; // the new buffer will be larger then the data outputted
-                total_samples = sampleCount / 2;
-
-                // downsample from 16kHz to 8kHz using simple decimation downsampling
-                resample_audio_simple(samples, sample_ptr, sampleCount);
-                isResampled = true;
-            }
-        } else {
-            if (wav_hz == 16000) {
-                BOOST_LOG_TRIVIAL(warning) << "ignoring audio at 16kHz samplerate, downsampling not enabled!";
-                return 1;
-            }
         }
 
         BOOST_FOREACH (auto& stream, streams) {
@@ -267,14 +225,14 @@ public:
                 }
                 BOOST_FOREACH (auto TGID, patched_talkgroups) {
                     if ((TGID == static_cast<long>(stream->TGID))) {
-                        BOOST_LOG_TRIVIAL(debug) << "got " << total_samples << " samples - " << total_samples * 2 << " bytes from recorder " << recorder_id << " for TGID " << TGID;
+                        BOOST_LOG_TRIVIAL(debug) << "got " << sampleCount << " samples - " << sampleCount * 2 << " bytes from recorder " << recorder_id << " for TGID " << TGID;
 
-                        int32_t bytes = total_samples * 2;
+                        int32_t bytes = sampleCount * 2;
                         const int16_t chunkSize = 320; // 20ms of 8kHz 16-bit audio (160 samples * 2 bytes)
                         int16_t totalChunks = bytes / chunkSize;
                         int32_t remainingBytes = bytes % chunkSize;
 
-                        uint8_t* sampleBytes = (uint8_t*)sample_ptr;
+                        uint8_t* sampleBytes = (uint8_t*)samples;
 
                         // queue chunks instead of sending immediately
                         std::lock_guard<std::mutex> lock(stream->queue_mutex);
@@ -357,12 +315,6 @@ public:
                 }
             }
         }
-
-        // if we resampled, free the buffer we created for the downsampled audio
-        if (isResampled) {
-            delete[] sample_ptr;
-        }
-
         return 0;
     }
 
@@ -425,33 +377,6 @@ public:
     }
 
 private:
-    /**
-     * @brief Simple audio resampling helper - downsample by decimation factor of 2 (16kHz to 8kHz) and apply a FIR filter
-     *  to handle Nyquist requirements.
-     * @param input 
-     * @param output 
-     * @param length 
-     */
-    void resample_audio_simple(const int16_t* input, int16_t* output, int length) {
-        int outIdx = 0;
-        for (int i = 0; i < length - FILTER_LEN; i += 2) {
-            float acc = 0.0f;
-
-            // apply FIR Filter
-            for (int j = 0; j < FILTER_LEN; j++) {
-                acc += input[i + j] * filter_coeffs[j];
-            }
-
-            // clamp result to 16-bit PCM range
-            if (acc > 32767.0f)
-                acc = 32767.0f;
-            if (acc < -32768.0f)
-                acc = -32768.0f;
-
-            output[outIdx++] = (int16_t)acc;
-        }
-    }
-
     /**
      * @brief Helper method to schedule the next send for an endpoint group.
      * @param group 
