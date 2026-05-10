@@ -63,8 +63,13 @@ std::vector<int16_t> downsample16kTo8k(const int16_t* samples, int sampleCount) 
 
     downsampled.reserve((sampleCount + 1) / 2);
 
-    for (int i = 0; i < sampleCount; i += 2) {
-        downsampled.push_back(samples[i]);
+    for (int i = 0; i + 1 < sampleCount; i += 2) {
+        int32_t mixed = static_cast<int32_t>(samples[i]) + static_cast<int32_t>(samples[i + 1]);
+        downsampled.push_back(static_cast<int16_t>(mixed / 2));
+    }
+
+    if ((sampleCount % 2) != 0) {
+        downsampled.push_back(samples[sampleCount - 1]);
     }
 
     return downsampled;
@@ -107,6 +112,12 @@ struct stream_t {
     bool silence_leader_injected = false;  // Track if silence leader has been added
     int32_t last_call_tgid = -1;  // Last talkgroup ID
     int32_t last_call_src = -1;   // Last source ID
+#ifdef DVMTRSTREAM_ANALOG_SUPPORT
+    std::vector<uint8_t> pending_audio;
+    int32_t pending_audio_tgid = -1;
+    int32_t pending_audio_src = -1;
+    std::chrono::steady_clock::time_point pending_audio_updated;
+#endif
 };
 
 std::vector<std::shared_ptr<stream_t>> streams;
@@ -330,31 +341,67 @@ public:
                         stream->last_call_tgid = call_tgid;
                         stream->last_call_src = call_src;
                         
-                        // queue complete chunks
-                        for (int i = 0; i < totalChunks; i++) {
-                            // calculate the starting position of the current chunk
-                            uint8_t* curChunkStart = sampleBytes + (i * chunkSize);
+#ifdef DVMTRSTREAM_ANALOG_SUPPORT
+                        if (wav_hz == 16000) {
+                            if (bytes > 0) {
+                                // Analog 16 kHz callbacks may be smaller than one 8 kHz DVMBridge frame.
+                                // Accumulate after downsampling so we do not stretch audio with per-callback padding.
+                                if (!stream->pending_audio.empty() &&
+                                    (stream->pending_audio_tgid != call_tgid || stream->pending_audio_src != call_src)) {
+                                    uint8_t paddedChunk[320];
+                                    ::memset(paddedChunk, 0, sizeof(paddedChunk));
+                                    ::memcpy(paddedChunk, stream->pending_audio.data(), stream->pending_audio.size());
 
-                            // queue the chunk
-                            audio_chunk_t audio_chunk(curChunkStart, chunkSize, call_tgid, call_src);
-                            stream->chunk_queue.push(audio_chunk);
-                        }
+                                    audio_chunk_t audio_chunk(paddedChunk, chunkSize, stream->pending_audio_tgid, stream->pending_audio_src);
+                                    stream->chunk_queue.push(audio_chunk);
+                                    stream->pending_audio.clear();
+                                }
 
-                        // handle partial chunk - pad with silence to full 320 bytes
-                        if (remainingBytes > 0) {
-                            uint8_t paddedChunk[320];
-                            ::memset(paddedChunk, 0, sizeof(paddedChunk)); // Zero = silence for 16-bit audio
+                                stream->pending_audio_tgid = call_tgid;
+                                stream->pending_audio_src = call_src;
+                                stream->pending_audio_updated = std::chrono::steady_clock::now();
+                                stream->pending_audio.insert(stream->pending_audio.end(), sampleBytes, sampleBytes + bytes);
 
-                            // copy partial audio data
-                            uint8_t* partialStart = sampleBytes + (totalChunks * chunkSize);
-                            ::memcpy(paddedChunk, partialStart, remainingBytes);
+                                size_t consumedBytes = 0;
+                                while (stream->pending_audio.size() - consumedBytes >= static_cast<size_t>(chunkSize)) {
+                                    audio_chunk_t audio_chunk(stream->pending_audio.data() + consumedBytes, chunkSize, call_tgid, call_src);
+                                    stream->chunk_queue.push(audio_chunk);
+                                    consumedBytes += chunkSize;
+                                }
 
-                            // queue padded chunk
-                            audio_chunk_t audio_chunk(paddedChunk, chunkSize, call_tgid, call_src);
-                            stream->chunk_queue.push(audio_chunk);
+                                if (consumedBytes > 0) {
+                                    stream->pending_audio.erase(stream->pending_audio.begin(), stream->pending_audio.begin() + consumedBytes);
+                                }
+                            }
+                        } else
+#endif
+                        {
+                            // queue complete chunks
+                            for (int i = 0; i < totalChunks; i++) {
+                                // calculate the starting position of the current chunk
+                                uint8_t* curChunkStart = sampleBytes + (i * chunkSize);
 
-                            BOOST_LOG_TRIVIAL(debug) << "padded partial chunk: " << remainingBytes << " bytes + " 
-                                                     << (chunkSize - remainingBytes) << " silence bytes for TGID " << TGID;
+                                // queue the chunk
+                                audio_chunk_t audio_chunk(curChunkStart, chunkSize, call_tgid, call_src);
+                                stream->chunk_queue.push(audio_chunk);
+                            }
+
+                            // handle partial chunk - pad with silence to full 320 bytes
+                            if (remainingBytes > 0) {
+                                uint8_t paddedChunk[320];
+                                ::memset(paddedChunk, 0, sizeof(paddedChunk)); // Zero = silence for 16-bit audio
+
+                                // copy partial audio data
+                                uint8_t* partialStart = sampleBytes + (totalChunks * chunkSize);
+                                ::memcpy(paddedChunk, partialStart, remainingBytes);
+
+                                // queue padded chunk
+                                audio_chunk_t audio_chunk(paddedChunk, chunkSize, call_tgid, call_src);
+                                stream->chunk_queue.push(audio_chunk);
+
+                                BOOST_LOG_TRIVIAL(debug) << "padded partial chunk: " << remainingBytes << " bytes + "
+                                                         << (chunkSize - remainingBytes) << " silence bytes for TGID " << TGID;
+                            }
                         }
                         
                         size_t queue_size = stream->chunk_queue.size();
@@ -462,6 +509,25 @@ private:
             auto& stream = group->streams[check_index];
 
             std::lock_guard<std::mutex> lock(stream->queue_mutex);
+#ifdef DVMTRSTREAM_ANALOG_SUPPORT
+            if (stream->chunk_queue.empty() && !stream->pending_audio.empty()) {
+                auto now = std::chrono::steady_clock::now();
+                if (now - stream->pending_audio_updated >= std::chrono::milliseconds(50)) {
+                    uint8_t paddedChunk[320];
+                    ::memset(paddedChunk, 0, sizeof(paddedChunk));
+                    ::memcpy(paddedChunk, stream->pending_audio.data(), stream->pending_audio.size());
+
+                    audio_chunk_t audio_chunk(paddedChunk, sizeof(paddedChunk), stream->pending_audio_tgid, stream->pending_audio_src);
+                    stream->chunk_queue.push(audio_chunk);
+
+                    BOOST_LOG_TRIVIAL(debug) << "flushed analog partial chunk: " << stream->pending_audio.size() << " bytes + "
+                                             << (sizeof(paddedChunk) - stream->pending_audio.size()) << " silence bytes for TGID "
+                                             << stream->pending_audio_tgid;
+
+                    stream->pending_audio.clear();
+                }
+            }
+#endif
             if (!stream->chunk_queue.empty()) {
                 // found stream with data - check if it's the current one or need to switch
                 if (check_index != group->current_stream_index) {
