@@ -6,6 +6,7 @@
  *
  *  Copyright (C) 2025,2026 Patrick McDonnell, W3AXL
  *  Copyright (C) 2026 Bryan Biedenkapp, N2PLL
+ *  Copyright (C) 2026 C. Lovell, K7CBL
  *
  */
 #include "../../trunk-recorder/plugin_manager/plugin_api.h"
@@ -20,6 +21,8 @@
 #include <thread>
 #include <chrono>
 #include <memory>
+#include <cstring>
+#include <vector>
 
 using namespace boost::asio;
 
@@ -42,6 +45,31 @@ typedef struct stream_t stream_t;
             buffer[1U + offset] = (val >> 16) & 0xFFU;  \
             buffer[2U + offset] = (val >> 8) & 0xFFU;   \
             buffer[3U + offset] = (val >> 0) & 0xFFU;
+
+#ifdef DVMTRSTREAM_ANALOG_SUPPORT
+/**
+ * @brief Downsamples Trunk Recorder conventional analog plugin audio.
+ *
+ * Trunk Recorder sends analog plugin audio at 16 kHz while digital audio is
+ * sent at 8 kHz. DVMBridge expects the existing 8 kHz mono signed PCM stream,
+ * so the analog build decimates to 8 kHz before using the normal send path.
+ */
+std::vector<int16_t> downsample16kTo8k(const int16_t* samples, int sampleCount) {
+    std::vector<int16_t> downsampled;
+
+    if (!samples || sampleCount <= 0) {
+        return downsampled;
+    }
+
+    downsampled.reserve((sampleCount + 1) / 2);
+
+    for (int i = 0; i < sampleCount; i += 2) {
+        downsampled.push_back(samples[i]);
+    }
+
+    return downsampled;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 //  Structure Declaration
@@ -117,6 +145,9 @@ class DVMTRStream : public Plugin_Api {
 
     int global_silence_leader = 0; // global silence leader in ms
     int global_inter_stream_delay = 0; // global inter-stream delay in ms
+#ifdef DVMTRSTREAM_ANALOG_SUPPORT
+    bool logged_analog_downsample = false;
+#endif
 
 public:
     /**
@@ -211,11 +242,30 @@ public:
         Recorder& local_recorder = *recorder;
         int recorder_id = local_recorder.get_num();
         long wav_hz = local_recorder.get_wav_hz();
+        int16_t* audio_samples = samples;
+        int audio_sample_count = sampleCount;
+#ifdef DVMTRSTREAM_ANALOG_SUPPORT
+        std::vector<int16_t> downsampled_samples;
+#endif
 
-        // ignore audio if it's not 8kHz (TODO: resample if it is)
+        // ignore audio if it's not 8kHz
         if (wav_hz != 8000) {
-            BOOST_LOG_TRIVIAL(warning) << "ignoring audio at " << wav_hz << " Hz samplerate, not currently supported!";
-            return 1;
+#ifdef DVMTRSTREAM_ANALOG_SUPPORT
+            if (wav_hz == 16000) {
+                downsampled_samples = downsample16kTo8k(samples, sampleCount);
+                audio_samples = downsampled_samples.data();
+                audio_sample_count = static_cast<int>(downsampled_samples.size());
+
+                if (!logged_analog_downsample) {
+                    BOOST_LOG_TRIVIAL(info) << "dvmtrstream: downsampling Trunk Recorder analog audio from 16000 Hz to 8000 Hz for DVMBridge";
+                    logged_analog_downsample = true;
+                }
+            } else
+#endif
+            {
+                BOOST_LOG_TRIVIAL(warning) << "ignoring audio at " << wav_hz << " Hz samplerate, not currently supported!";
+                return 1;
+            }
         }
 
         BOOST_FOREACH (auto& stream, streams) {
@@ -225,14 +275,14 @@ public:
                 }
                 BOOST_FOREACH (auto TGID, patched_talkgroups) {
                     if ((TGID == static_cast<long>(stream->TGID))) {
-                        BOOST_LOG_TRIVIAL(debug) << "got " << sampleCount << " samples - " << sampleCount * 2 << " bytes from recorder " << recorder_id << " for TGID " << TGID;
+                        BOOST_LOG_TRIVIAL(debug) << "got " << audio_sample_count << " samples - " << audio_sample_count * 2 << " bytes from recorder " << recorder_id << " for TGID " << TGID;
 
-                        int32_t bytes = sampleCount * 2;
+                        int32_t bytes = audio_sample_count * 2;
                         const int16_t chunkSize = 320; // 20ms of 8kHz 16-bit audio (160 samples * 2 bytes)
                         int16_t totalChunks = bytes / chunkSize;
                         int32_t remainingBytes = bytes % chunkSize;
 
-                        uint8_t* sampleBytes = (uint8_t*)samples;
+                        uint8_t* sampleBytes = (uint8_t*)audio_samples;
 
                         // queue chunks instead of sending immediately
                         std::lock_guard<std::mutex> lock(stream->queue_mutex);
