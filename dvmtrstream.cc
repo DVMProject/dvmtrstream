@@ -109,6 +109,9 @@ struct stream_t {
     ip::udp::endpoint remote_endpoint;
     std::queue<audio_chunk_t> chunk_queue;
     std::mutex queue_mutex;
+    std::chrono::steady_clock::time_point last_enqueue_time{};
+    std::chrono::steady_clock::time_point last_send_time{};
+    bool call_active = false;
     bool silence_leader_injected = false;  // Track if silence leader has been added
     int32_t last_call_tgid = -1;  // Last talkgroup ID
     int32_t last_call_src = -1;   // Last source ID
@@ -135,6 +138,10 @@ std::vector<std::shared_ptr<stream_t>> streams;
     int inter_stream_delay_ms = 0;  // Delay between switching streams (ms)
     bool switching_stream = false;  // True when in delay period between streams
     int silence_leader_ms = 0;  // Silence to inject before stream audio (ms)
+    bool strict_call_serialization = true;
+    int call_gap_hold_ms = 250;
+    int send_tick_ms = 15;
+    int call_active_stale_ms = 1200;
 };
 
 std::vector<std::shared_ptr<endpoint_group_t>> endpoint_groups;
@@ -156,6 +163,10 @@ class DVMTRStream : public Plugin_Api {
 
     int global_silence_leader = 0; // global silence leader in ms
     int global_inter_stream_delay = 0; // global inter-stream delay in ms
+    bool global_strict_call_serialization = true;
+    int global_call_gap_hold_ms = 250;
+    int global_send_tick_ms = 15;
+    int global_call_active_stale_ms = 1200;
 #ifdef DVMTRSTREAM_ANALOG_SUPPORT
     bool logged_analog_downsample = false;
 #endif
@@ -186,6 +197,27 @@ public:
             BOOST_LOG_TRIVIAL(info) << "dvmtrstream: silence leader set to " << global_silence_leader << "ms";
         }
 
+        if (config_data.contains("strictCallSerialization")) {
+            global_strict_call_serialization = config_data["strictCallSerialization"];
+            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: strict call serialization "
+                                    << (global_strict_call_serialization ? "enabled" : "disabled");
+        }
+
+        if (config_data.contains("callGapHoldMs")) {
+            global_call_gap_hold_ms = config_data["callGapHoldMs"];
+            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: call gap hold set to " << global_call_gap_hold_ms << "ms";
+        }
+
+        if (config_data.contains("sendTickMs")) {
+            global_send_tick_ms = config_data["sendTickMs"];
+            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: send tick set to " << global_send_tick_ms << "ms";
+        }
+
+        if (config_data.contains("callActiveStaleMs")) {
+            global_call_active_stale_ms = config_data["callActiveStaleMs"];
+            BOOST_LOG_TRIVIAL(info) << "dvmtrstream: active call stale timeout set to " << global_call_active_stale_ms << "ms";
+        }
+
         for (json element : config_data["streams"]) {
             auto stream = std::make_shared<stream_t>();
             stream->TGID = element["TGID"];
@@ -203,6 +235,10 @@ public:
                 group->endpoint_key = endpoint_key;
                 group->inter_stream_delay_ms = global_inter_stream_delay;
                 group->silence_leader_ms = global_silence_leader;
+                group->strict_call_serialization = global_strict_call_serialization;
+                group->call_gap_hold_ms = global_call_gap_hold_ms;
+                group->send_tick_ms = global_send_tick_ms;
+                group->call_active_stale_ms = global_call_active_stale_ms;
                 endpoint_map[endpoint_key] = group;
                 endpoint_groups.push_back(group);
                 BOOST_LOG_TRIVIAL(info) << "dvmtrstream: created endpoint group for " << endpoint_key;
@@ -297,11 +333,19 @@ public:
 
                         // queue chunks instead of sending immediately
                         std::lock_guard<std::mutex> lock(stream->queue_mutex);
+                        stream->last_enqueue_time = std::chrono::steady_clock::now();
+                        stream->call_active = true;
+
+                        int32_t effective_src = call_src;
+                        if (effective_src < 0 && stream->last_call_tgid == call_tgid && stream->last_call_src > 0) {
+                            // Reuse previous valid source for this stream while call metadata catches up.
+                            effective_src = stream->last_call_src;
+                        }
                         
                         // are we injecting a silence leader?
                         if (global_silence_leader > 0) {
                             // check if call source or talkgroup changed
-                            bool call_changed = (stream->last_call_tgid != call_tgid || stream->last_call_src != call_src);
+                            bool call_changed = (stream->last_call_tgid != call_tgid || stream->last_call_src != effective_src);
 
                             // inject silence leader if configured and call changed
                             if (call_changed && !stream->silence_leader_injected) {
@@ -325,21 +369,21 @@ public:
                                     ::memset(silenceChunk, 0, sizeof(silenceChunk));
 
                                     for (int i = 0; i < silence_chunks; i++) {
-                                        audio_chunk_t silent_chunk(silenceChunk, chunkSize, call_tgid, call_src);
+                                        audio_chunk_t silent_chunk(silenceChunk, chunkSize, call_tgid, effective_src);
                                         stream->chunk_queue.push(silent_chunk);
                                     }
 
                                     stream->silence_leader_injected = true;
                                     BOOST_LOG_TRIVIAL(debug) << "injected " << silence_chunks << " silence chunks (" 
                                                             << (silence_chunks * 20) << "ms) before audio for TGID " << TGID 
-                                                            << " SRC " << call_src << " (call changed)";
+                                                            << " SRC " << effective_src << " (call changed)";
                                 }
                             }
                         }
 
                         // update last call tracking
                         stream->last_call_tgid = call_tgid;
-                        stream->last_call_src = call_src;
+                        stream->last_call_src = effective_src;
                         
 #ifdef DVMTRSTREAM_ANALOG_SUPPORT
                         if (wav_hz == 16000) {
@@ -358,13 +402,13 @@ public:
                                 }
 
                                 stream->pending_audio_tgid = call_tgid;
-                                stream->pending_audio_src = call_src;
+                                stream->pending_audio_src = effective_src;
                                 stream->pending_audio_updated = std::chrono::steady_clock::now();
                                 stream->pending_audio.insert(stream->pending_audio.end(), sampleBytes, sampleBytes + bytes);
 
                                 size_t consumedBytes = 0;
                                 while (stream->pending_audio.size() - consumedBytes >= static_cast<size_t>(chunkSize)) {
-                                    audio_chunk_t audio_chunk(stream->pending_audio.data() + consumedBytes, chunkSize, call_tgid, call_src);
+                                    audio_chunk_t audio_chunk(stream->pending_audio.data() + consumedBytes, chunkSize, call_tgid, effective_src);
                                     stream->chunk_queue.push(audio_chunk);
                                     consumedBytes += chunkSize;
                                 }
@@ -382,7 +426,7 @@ public:
                                 uint8_t* curChunkStart = sampleBytes + (i * chunkSize);
 
                                 // queue the chunk
-                                audio_chunk_t audio_chunk(curChunkStart, chunkSize, call_tgid, call_src);
+                                audio_chunk_t audio_chunk(curChunkStart, chunkSize, call_tgid, effective_src);
                                 stream->chunk_queue.push(audio_chunk);
                             }
 
@@ -396,7 +440,7 @@ public:
                                 ::memcpy(paddedChunk, partialStart, remainingBytes);
 
                                 // queue padded chunk
-                                audio_chunk_t audio_chunk(paddedChunk, chunkSize, call_tgid, call_src);
+                                audio_chunk_t audio_chunk(paddedChunk, chunkSize, call_tgid, effective_src);
                                 stream->chunk_queue.push(audio_chunk);
 
                                 BOOST_LOG_TRIVIAL(debug) << "padded partial chunk: " << remainingBytes << " bytes + "
@@ -412,6 +456,48 @@ public:
                 }
             }
         }
+        return 0;
+    }
+
+    /**
+     * @brief Marks matching stream calls as inactive when trunk-recorder closes a call.
+     * @param call_info
+     * @returns int 
+     */
+    int call_end(Call_Data_t call_info) {
+        std::vector<long> ended_talkgroups;
+        ended_talkgroups.push_back(call_info.talkgroup);
+        for (auto patched_tgid : call_info.patched_talkgroups) {
+            ended_talkgroups.push_back(static_cast<long>(patched_tgid));
+        }
+
+        for (auto& stream : streams) {
+            if (!stream) {
+                continue;
+            }
+
+            if (!(stream->short_name.empty() || stream->short_name == call_info.short_name)) {
+                continue;
+            }
+
+            bool matches = false;
+            for (auto ended_tgid : ended_talkgroups) {
+                if (ended_tgid == stream->TGID) {
+                    matches = true;
+                    break;
+                }
+            }
+
+            if (!matches) {
+                continue;
+            }
+
+            std::lock_guard<std::mutex> lock(stream->queue_mutex);
+            stream->call_active = false;
+            stream->last_call_tgid = -1;
+            stream->last_call_src = -1;
+        }
+
         return 0;
     }
 
@@ -482,7 +568,7 @@ private:
         if (!group || !group->timer || !group->timer_active) 
             return;
 
-        group->timer->expires_from_now(std::chrono::milliseconds(15));
+        group->timer->expires_from_now(std::chrono::milliseconds(group->send_tick_ms));
         group->timer->async_wait([this, group](const boost::system::error_code& error) {
             if (!error && group->timer_active) {
                 send_next_chunk(group);
@@ -500,13 +586,111 @@ private:
             return;
         }
 
+        auto has_recent_activity = [group](const std::shared_ptr<stream_t>& stream) {
+            if (!stream) {
+                return false;
+            }
+
+            std::lock_guard<std::mutex> lock(stream->queue_mutex);
+            if (stream->last_enqueue_time == std::chrono::steady_clock::time_point{} &&
+                stream->last_send_time == std::chrono::steady_clock::time_point{}) {
+                return false;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            auto last_activity = stream->last_enqueue_time;
+            if (stream->last_send_time > last_activity) {
+                last_activity = stream->last_send_time;
+            }
+
+            return now - last_activity < std::chrono::milliseconds(group->call_gap_hold_ms);
+        };
+
         // find next stream with data in this endpoint group, starting from current_stream_index
         stream_t* active_stream = nullptr;
         size_t start_index = group->current_stream_index;
 
+        if (group->strict_call_serialization && group->current_stream_index < group->streams.size()) {
+            auto& pinned_stream = group->streams[group->current_stream_index];
+            bool pinned_call_active = false;
+
+            // scope is intentional
+            {
+                std::lock_guard<std::mutex> lock(pinned_stream->queue_mutex);
+#ifdef DVMTRSTREAM_ANALOG_SUPPORT
+                if (pinned_stream->chunk_queue.empty() && !pinned_stream->pending_audio.empty()) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - pinned_stream->pending_audio_updated >= std::chrono::milliseconds(50)) {
+                        uint8_t paddedChunk[320];
+                        ::memset(paddedChunk, 0, sizeof(paddedChunk));
+                        ::memcpy(paddedChunk, pinned_stream->pending_audio.data(), pinned_stream->pending_audio.size());
+
+                        audio_chunk_t audio_chunk(paddedChunk, sizeof(paddedChunk), pinned_stream->pending_audio_tgid, pinned_stream->pending_audio_src);
+                        pinned_stream->chunk_queue.push(audio_chunk);
+                        pinned_stream->pending_audio.clear();
+                    }
+                }
+#endif
+                if (!pinned_stream->chunk_queue.empty()) {
+                    active_stream = pinned_stream.get();
+                }
+                pinned_call_active = pinned_stream->call_active;
+            }
+
+            if (!active_stream && pinned_call_active) {
+                if (has_recent_activity(pinned_stream)) {
+                    schedule_next_send(group);
+                    return;
+                }
+
+                // scope is intentional
+                {
+                    std::lock_guard<std::mutex> lock(pinned_stream->queue_mutex);
+                    auto now = std::chrono::steady_clock::now();
+                    auto last_activity = pinned_stream->last_enqueue_time;
+                    if (pinned_stream->last_send_time > last_activity) {
+                        last_activity = pinned_stream->last_send_time;
+                    }
+
+                    if (last_activity != std::chrono::steady_clock::time_point{}) {
+                        auto idle_for = now - last_activity;
+                        if (idle_for < std::chrono::milliseconds(group->call_active_stale_ms)) {
+                            schedule_next_send(group);
+                            return;
+                        }
+                    } else {
+                        schedule_next_send(group);
+                        return;
+                    }
+
+                    BOOST_LOG_TRIVIAL(info) << "dvmtrstream: releasing stale active call latch for endpoint "
+                                            << group->endpoint_key << " TGID " << pinned_stream->TGID
+                                            << " after " << group->call_active_stale_ms << "ms idle";
+                    pinned_stream->call_active = false;
+                }
+            }
+
+            if (!active_stream && has_recent_activity(pinned_stream)) {
+                schedule_next_send(group);
+                return;
+            }
+
+            // In strict mode, if the pinned stream has data, never scan/switch
+            // to another stream in this cycle. This enforces hard serialization.
+            if (active_stream != nullptr) {
+                goto SEND_ACTIVE_STREAM;
+            }
+
+            start_index = (group->current_stream_index + 1) % group->streams.size();
+        }
+
         for (size_t i = 0; i < group->streams.size(); i++) {
             size_t check_index = (start_index + i) % group->streams.size();
             auto& stream = group->streams[check_index];
+
+            if (group->strict_call_serialization && check_index == group->current_stream_index && active_stream != nullptr) {
+                continue;
+            }
 
             std::lock_guard<std::mutex> lock(stream->queue_mutex);
 #ifdef DVMTRSTREAM_ANALOG_SUPPORT
@@ -545,11 +729,14 @@ private:
             return;
         }
 
+SEND_ACTIVE_STREAM:
+
         // send chunk from active stream
         std::unique_lock<std::mutex> lock(active_stream->queue_mutex);
         audio_chunk_t chunk = active_stream->chunk_queue.front();
         active_stream->chunk_queue.pop();
         bool has_more = !active_stream->chunk_queue.empty();
+        active_stream->last_send_time = std::chrono::steady_clock::now();
         lock.unlock();
 
         // send the chunk
@@ -567,10 +754,8 @@ private:
             dstId = 0;
         }
 
-        // limit to 24 bits
-        if (dstId > 0xFFFFFF) {
-            dstId = 0;
-        }
+        // DVMBridge payload stores 24-bit IDs; preserve lower bits for larger values.
+        dstId &= 0xFFFFFF;
 
         SET_UINT32(dstId, chunkBuffer, 4 + chunk.data.size());
 
@@ -581,10 +766,8 @@ private:
             srcId = 0;
         }
 
-        // limit to 24 bits
-        if (srcId > 0xFFFFFF) {
-            srcId = 0;
-        }
+        // DVMBridge payload stores 24-bit IDs; preserve lower bits for larger values.
+        srcId &= 0xFFFFFF;
 
         SET_UINT32(srcId, chunkBuffer, 8 + chunk.data.size());
 
@@ -599,8 +782,21 @@ private:
 
         // if current stream is empty, move to next stream on next cycle
         if (!has_more) {
-            // reset silence leader flag for next transmission
-            active_stream->silence_leader_injected = false;
+            // scope is intentional
+            {
+                std::lock_guard<std::mutex> stream_lock(active_stream->queue_mutex);
+                // reset silence leader flag for next transmission
+                active_stream->silence_leader_injected = false;
+                if (active_stream->chunk_queue.empty() && !active_stream->call_active) {
+                    active_stream->last_call_tgid = -1;
+                    active_stream->last_call_src = -1;
+                }
+            }
+
+            if (group->strict_call_serialization) {
+                schedule_next_send(group);
+                return;
+            }
 
             // check if inter-stream delay is configured
             if (group->inter_stream_delay_ms > 0) {
